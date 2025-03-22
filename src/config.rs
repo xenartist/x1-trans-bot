@@ -10,6 +10,9 @@ use solana_sdk::{
 use std::str::FromStr;
 use bip39::{Mnemonic, Language};
 use rand::{rngs::OsRng, RngCore};
+use solana_sdk::signature::read_keypair_file;
+use std::error::Error;
+use crate::wallet::WalletManager;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Config {

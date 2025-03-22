@@ -30,10 +30,12 @@ impl TransferService {
     pub fn new(config: Config) -> Result<Self> {
         // get master keypair
         let master_keypair = config.get_master_keypair()?;
+        println!("Using master keypair for funding: {}", master_keypair.pubkey());
         
-        // create wallet manager
+        // create wallet manager - pass master_keypair and seed passphrase
         let wallet_manager = WalletManager::new(
             master_keypair, 
+            config.seed_passphrase.clone(),
             config.concurrency
         )?;
         
@@ -59,10 +61,6 @@ impl TransferService {
         println!("Testing RPC endpoints...");
         self.test_rpc_endpoints().await?;
         
-        // Parse target pubkey
-        let target_pubkey = Pubkey::from_str(&self.config.target_pubkey)
-            .context("Invalid target pubkey")?;
-
         // Calculate lamports (1 SOL = 1,000,000,000 lamports)
         let lamports = (self.config.amount * 1_000_000_000.0) as u64;
         
@@ -80,7 +78,7 @@ impl TransferService {
         let total_tx_sent = Arc::new(AtomicUsize::new(0));
         let start_time = Instant::now();
 
-        println!("Starting transfers to: {}", target_pubkey);
+        println!("Starting self-transfers (each wallet sends to itself)");
         println!("Amount per transfer: {} SOL ({} lamports)", 
             self.config.amount, 
             lamports
@@ -94,8 +92,13 @@ impl TransferService {
         );
         println!("Using {} RPC endpoints", self.config.rpc_urls.len());
 
+        // create a vector of derived wallet public keys, not trying to copy Keypair objects
+        let derived_pubkeys: Vec<_> = self.wallet_manager.derived_keypairs()
+            .iter()
+            .map(|k| k.pubkey())
+            .collect();
+        
         // start balance monitoring thread
-        let derived_keypairs = self.wallet_manager.derived_keypairs().to_vec();
         let running_flag_for_monitor = running_flag.clone();
         let rpc_manager = self.rpc_manager.clone();
         let total_tx_for_monitor = total_tx_sent.clone();
@@ -110,9 +113,9 @@ impl TransferService {
                 let client_url = client.url().to_string();
                 
                 // check balance of all derived wallets
-                for (i, keypair) in derived_keypairs.iter().enumerate() {
+                for (i, pubkey) in derived_pubkeys.iter().enumerate() {
                     let start = Instant::now();
-                    match client.get_balance(&keypair.pubkey()) {
+                    match client.get_balance(pubkey) {
                         Ok(balance) => {
                             rpc_manager.record_result(&client_url, true, start.elapsed());
                             
@@ -159,10 +162,11 @@ impl TransferService {
 
         // start transfer tasks
         let mut handles = vec![];
-
+        
+        // directly use derived_keypairs reference, because Solana's keypairs cannot be cloned
         for (i, keypair) in self.wallet_manager.derived_keypairs().iter().enumerate() {
-            let keypair = keypair.clone();
-            let target = target_pubkey;
+            // do not clone keypair, only get its reference and public key
+            let keypair_pubkey = keypair.pubkey();
             let success_counter = success_count.clone();
             let error_counter = error_count.clone();
             let is_running = running_flag.clone();
@@ -170,18 +174,26 @@ impl TransferService {
             let lamports = lamports;
             let rpc_manager = self.rpc_manager.clone();
             
+            // to use keypair in async tasks, we need to create a new keypair
+            // copy the byte data from the original keypair (this is a safe method)
+            let keypair_bytes = keypair.to_bytes();
+            
             let handle = tokio::spawn(async move {
-                println!("Task {} started with wallet {}", i, keypair.pubkey());
+                // create a new keypair in tasks
+                let task_keypair = Keypair::from_bytes(&keypair_bytes)
+                    .expect("Failed to recreate keypair from bytes");
+                
+                println!("Task {} started with wallet {} (sending to self)", i, keypair_pubkey);
                 
                 while is_running.load(Ordering::SeqCst) {
-                    // get next client
+                    // get next rpc client
                     let client = rpc_manager.next_client();
                     let client_url = client.url().to_string();
                     
                     // create and send transaction, without waiting for confirmation
                     let instruction = system_instruction::transfer(
-                        &keypair.pubkey(),
-                        &target,
+                        &task_keypair.pubkey(),
+                        &keypair_pubkey, // send to self
                         lamports,
                     );
                     
@@ -194,8 +206,8 @@ impl TransferService {
                             
                             let transaction = Transaction::new_signed_with_payer(
                                 &[instruction],
-                                Some(&keypair.pubkey()),
-                                &[&*keypair as &dyn Signer],
+                                Some(&task_keypair.pubkey()),
+                                &[&task_keypair],
                                 recent_blockhash,
                             );
                             
@@ -278,22 +290,62 @@ impl TransferService {
         // get master rpc client
         let client = self.rpc_manager.next_client();
         
+        // first check if master wallet has enough balance
+        let master_balance = client.get_balance(&self.wallet_manager.master_keypair().pubkey())?;
+        println!("Master wallet balance: {} SOL", master_balance as f64 / 1_000_000_000.0);
+        
+        let mut total_funding_needed = 0;
+        let mut wallets_needing_funds = vec![];
+        
+        // first check all derived wallets, calculate total funding needed
         for (i, keypair) in self.wallet_manager.derived_keypairs().iter().enumerate() {
             let balance = client.get_balance(&keypair.pubkey())?;
+            let balance_sol = balance as f64 / 1_000_000_000.0;
             
             if balance < target_balance {
                 let amount_to_transfer = target_balance - balance;
+                let amount_sol = amount_to_transfer as f64 / 1_000_000_000.0;
                 
-                println!("Funding wallet {} ({}) with {} SOL", 
+                println!("Wallet {} ({}) needs additional {} SOL (current: {} SOL)", 
                     i, 
                     keypair.pubkey().to_string(), 
-                    amount_to_transfer as f64 / 1_000_000_000.0
+                    amount_sol,
+                    balance_sol
+                );
+                
+                total_funding_needed += amount_to_transfer;
+                wallets_needing_funds.push((i, keypair.pubkey(), amount_to_transfer));
+            } else {
+                println!("Wallet {} already has sufficient balance: {} SOL", 
+                    i, 
+                    balance_sol
+                );
+            }
+        }
+        
+        // check if master wallet has enough balance
+        if total_funding_needed > 0 {
+            if master_balance < total_funding_needed + 5_000_000 {  // reserve 0.005 SOL for fee
+                return Err(anyhow::anyhow!("Master wallet has insufficient balance to fund derived wallets. Need {} SOL but only have {} SOL", 
+                    (total_funding_needed + 5_000_000) as f64 / 1_000_000_000.0,
+                    master_balance as f64 / 1_000_000_000.0
+                ));
+            }
+            
+            println!("Total funding needed: {} SOL", total_funding_needed as f64 / 1_000_000_000.0);
+            
+            // fund each derived wallet
+            for (i, pubkey, amount) in wallets_needing_funds {
+                println!("Funding wallet {} ({}) with {} SOL", 
+                    i, 
+                    pubkey.to_string(), 
+                    amount as f64 / 1_000_000_000.0
                 );
                 
                 let instruction = system_instruction::transfer(
                     &self.wallet_manager.master_keypair().pubkey(),
-                    &keypair.pubkey(),
-                    amount_to_transfer,
+                    &pubkey,
+                    amount,
                 );
                 
                 let recent_blockhash = client.get_latest_blockhash()?;
@@ -307,12 +359,9 @@ impl TransferService {
                 
                 let signature = client.send_and_confirm_transaction(&transaction)?;
                 println!("  Funded with transaction: {}", signature);
-            } else {
-                println!("Wallet {} already has sufficient balance: {} SOL", 
-                    i, 
-                    balance as f64 / 1_000_000_000.0
-                );
             }
+        } else {
+            println!("All wallets are already funded to target balance");
         }
         
         Ok(())

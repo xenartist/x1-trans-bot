@@ -9,57 +9,77 @@ use solana_sdk::{
 };
 use std::sync::Arc;
 use bip39::{Mnemonic, Language};
+use ed25519_dalek::SigningKey;
+use hmac::{Hmac, Mac};
+use sha2::Sha512;
+
+type HmacSha512 = Hmac<Sha512>;
 
 // simplified HD wallet manager
 pub struct WalletManager {
-    master_keypair: Keypair,
-    derived_keypairs: Vec<Arc<Keypair>>,
+    master_keypair: Keypair,     // master keypair generated directly from seed
+    derived_keypairs: Vec<Keypair>, // derived sub wallets through BIP44 standard
+    mnemonic: Option<String>,    // save mnemonic for use when needed
 }
 
 impl WalletManager {
-    // Create a new wallet manager from master keypair
-    pub fn new(master_keypair: Keypair, count: usize) -> Result<Self> {
-        let derived_keypairs = Self::derive_multiple_wallets(&master_keypair, count)?;
+    // create wallet manager, use provided master_keypair and seed passphrase
+    // master_keypair is generated from seed in config, used for funding
+    // derived wallets are derived from seed using BIP44 standard
+    pub fn new(master_keypair: Keypair, mnemonic_phrase: Option<String>, num_wallets: usize) -> Result<Self> {
+        if num_wallets == 0 {
+            return Err(anyhow!("Number of wallets must be greater than 0"));
+        }
+        
+        let master_pubkey = master_keypair.pubkey();
+        println!("Using master wallet for funding: {}", master_pubkey);
+        
+        // derive sub wallets - use BIP44 standard if there is a seed passphrase, otherwise use simple derivation
+        let derived_keypairs = if let Some(phrase) = &mnemonic_phrase {
+            Self::derive_hd_wallets_from_mnemonic(phrase, num_wallets)?
+        } else {
+            // if there is no seed passphrase, fallback to simple derivation
+            let mut keypairs = Vec::with_capacity(num_wallets);
+            for i in 0..num_wallets {
+                let derived = Self::derive_keypair_from_master(&master_keypair, i)?;
+                println!("Derived wallet {} with pubkey: {} (simple derivation)", 
+                    i, derived.pubkey());
+                keypairs.push(derived);
+            }
+            keypairs
+        };
+        
+        println!("Created {} derived wallets", derived_keypairs.len());
         
         Ok(Self {
             master_keypair,
             derived_keypairs,
+            mnemonic: mnemonic_phrase,
         })
     }
     
-    // create wallet manager from mnemonic phrase
-    pub fn from_mnemonic(mnemonic_phrase: &str, count: usize) -> Result<Self> {
-        // use BIP39 to convert mnemonic phrase to seed
-        // fix method call
-        let mnemonic = Mnemonic::parse_normalized(mnemonic_phrase)
-            .map_err(|e| anyhow!("Invalid mnemonic phrase: {}", e))?;
-            
-        // use empty password to generate seed
+    // derive sub wallets from seed using BIP44 standard
+    fn derive_hd_wallets_from_mnemonic(phrase: &str, num_wallets: usize) -> Result<Vec<Keypair>> {
+        let mnemonic = Mnemonic::parse_in_normalized(Language::English, phrase)
+            .context("Invalid mnemonic phrase")?;
+        
+        // generate seed
         let seed = mnemonic.to_seed("");
         
-        // create master keypair from seed
-        let master_keypair = keypair_from_seed(&seed[..32])
-            .map_err(|e| anyhow!("Failed to create keypair from seed: {}", e))?;
-            
-        Self::new(master_keypair, count)
-    }
-    
-    // Derive multiple wallets using a simple deterministic approach
-    fn derive_multiple_wallets(master_keypair: &Keypair, count: usize) -> Result<Vec<Arc<Keypair>>> {
-        let mut derived_keypairs = Vec::with_capacity(count);
+        println!("Deriving HD wallets using BIP44 standard path m/44'/501'/0'/i");
         
-        // get seed material
-        let seed_material = master_keypair.to_bytes();
+        let mut derived_keypairs = Vec::with_capacity(num_wallets);
         
-        for i in 0..count {
-            // create a specific seed for each index
-            let derived_seed = derive_seed_at_index(&seed_material, i)?;
+        for i in 0..num_wallets {
+            // derive path m/44'/501'/0'/i
+            let wallet_path = format!("m/44'/501'/0'/{}", i);
+            let (child_keypair, _) = Self::derive_path_from_seed(&seed, &wallet_path)
+                .context(format!("Failed to derive key for path {}", wallet_path))?;
             
-            // create keypair from derived seed
-            let keypair = keypair_from_seed(&derived_seed)
-                .map_err(|e| anyhow!("Failed to create derived keypair {}: {}", i, e))?;
-                
-            derived_keypairs.push(Arc::new(keypair));
+            println!("Derived wallet {} with pubkey: {} (path: {})", 
+                i, child_keypair.pubkey(), wallet_path);
+            
+            derived_keypairs.push(child_keypair);
         }
         
         Ok(derived_keypairs)
@@ -71,7 +91,7 @@ impl WalletManager {
     }
     
     // Get derived keypairs
-    pub fn derived_keypairs(&self) -> &[Arc<Keypair>] {
+    pub fn derived_keypairs(&self) -> &[Keypair] {
         &self.derived_keypairs
     }
     
@@ -129,35 +149,124 @@ impl WalletManager {
         
         Ok(total)
     }
-}
 
-// helper function to derive child seed from master seed and index - simplified version
-fn derive_seed_at_index(master_seed: &[u8], index: usize) -> Result<[u8; 32]> {
-    let mut derived_seed = [0u8; 32];
-    
-    // basic deterministic derivation method
-    // copy part of master seed
-    let copy_len = std::cmp::min(master_seed.len(), 20);
-    derived_seed[..copy_len].copy_from_slice(&master_seed[..copy_len]);
-    
-    // mix index (encode index into 4 bytes)
-    derived_seed[20] = (index & 0xFF) as u8;
-    derived_seed[21] = ((index >> 8) & 0xFF) as u8;
-    derived_seed[22] = ((index >> 16) & 0xFF) as u8;
-    derived_seed[23] = ((index >> 24) & 0xFF) as u8;
-    
-    // mix more entropy
-    for i in 24..32 {
-        if i < master_seed.len() && (i - 24) < master_seed.len() {
-            derived_seed[i] = master_seed[i] ^ master_seed[i - 24];
-        } else if i < master_seed.len() {
-            derived_seed[i] = master_seed[i];
-        } else if (i - 24) < master_seed.len() {
-            derived_seed[i] = master_seed[i - 24];
-        } else {
-            derived_seed[i] = i as u8; // last fallback
-        }
+    // get derived keypair from master keypair
+    fn derive_keypair_from_master(master: &Keypair, index: usize) -> Result<Keypair> {
+        // use HMAC-SHA512 to derive sub wallet key
+        let mut mac = HmacSha512::new_from_slice(master.pubkey().as_ref())
+            .context("Failed to create HMAC")?;
+        
+        // use index as message
+        mac.update(&index.to_le_bytes());
+        
+        // get HMAC result
+        let result = mac.finalize().into_bytes();
+        
+        // use first 32 bytes of HMAC result as new private key
+        let keypair = Keypair::from_bytes(&result[0..32])
+            .context("Failed to create keypair from derived bytes")?;
+        
+        Ok(keypair)
     }
-    
-    Ok(derived_seed)
+
+    // parse BIP32/BIP44 path
+    fn parse_path(path: &str) -> Result<Vec<u32>> {
+        let mut result = Vec::new();
+        
+        // remove leading "m/"
+        let path = path.strip_prefix("m/").unwrap_or(path);
+        
+        // parse path segments
+        for segment in path.split('/') {
+            if segment.is_empty() {
+                continue;
+            }
+            
+            // check if it is a hardened derivation (with ' suffix)
+            let hardened = segment.ends_with('\'');
+            let index_str = if hardened {
+                &segment[..segment.len() - 1]
+            } else {
+                segment
+            };
+            
+            // parse index
+            let index = index_str.parse::<u32>()
+                .context(format!("Invalid path segment: {}", segment))?;
+            
+            // if it is a hardened derivation, add hardened flag (0x80000000)
+            let final_index = if hardened {
+                index | 0x80000000
+            } else {
+                index
+            };
+            
+            result.push(final_index);
+        }
+        
+        Ok(result)
+    }
+
+    // derive keypair from seed for specific path
+    fn derive_path_from_seed(seed: &[u8], path: &str) -> Result<(Keypair, [u8; 32])> {
+        // parse HD path
+        let indices = Self::parse_path(path)?;
+        
+        // generate master key
+        let mut hmac = HmacSha512::new_from_slice(b"ed25519 seed")
+            .context("Failed to create HMAC for master key")?;
+        hmac.update(seed);
+        let i = hmac.finalize().into_bytes();
+        
+        let mut key = [0u8; 32];
+        let mut chain_code = [0u8; 32];
+        
+        key.copy_from_slice(&i[0..32]);
+        chain_code.copy_from_slice(&i[32..64]);
+        
+        // derive sub key
+        for child_index in indices {
+            // prepare data for derivation
+            let mut data = Vec::with_capacity(37);
+            
+            if child_index & 0x80000000 != 0 {
+                // Hardened key: 0x00 || parent_key || index
+                data.push(0);
+                data.extend_from_slice(&key);
+            } else {
+                // Normal key: public_key || index
+                // calculate public key from private key - use ed25519-dalek 2.x API
+                let signing_key = SigningKey::from_bytes(&key);
+                let verifying_key = signing_key.verifying_key();
+                
+                data.extend_from_slice(&verifying_key.to_bytes());
+            }
+            
+            // add index (big endian)
+            data.extend_from_slice(&child_index.to_be_bytes());
+            
+            // calculate sub key
+            let mut hmac = HmacSha512::new_from_slice(&chain_code)
+                .context("Failed to create HMAC for child key")?;
+            hmac.update(&data);
+            let i = hmac.finalize().into_bytes();
+            
+            key.copy_from_slice(&i[0..32]);
+            chain_code.copy_from_slice(&i[32..64]);
+        }
+        
+        // calculate keypair using ed25519-dalek 2.x
+        let signing_key = SigningKey::from_bytes(&key);
+        let verifying_key = signing_key.verifying_key();
+        
+        // convert to Solana format Keypair
+        let mut keypair_bytes = [0u8; 64];
+        keypair_bytes[0..32].copy_from_slice(&key);
+        keypair_bytes[32..64].copy_from_slice(&verifying_key.to_bytes());
+        
+        let solana_keypair = Keypair::from_bytes(&keypair_bytes)
+            .context("Failed to create Solana keypair")?;
+        
+        Ok((solana_keypair, chain_code))
+    }
 } 
