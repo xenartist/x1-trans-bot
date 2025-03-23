@@ -1,12 +1,12 @@
 mod config;
-mod wallet;
 mod transfer;
+mod wallet;
 mod rpc_manager;
 
-use anyhow::Result;
-use clap::Parser;
 use crate::config::Config;
 use crate::transfer::TransferService;
+use anyhow::Result;
+use clap::Parser;
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about = "Solana automatic transfer tool")]
@@ -32,7 +32,7 @@ async fn main() -> Result<()> {
         let config = Config::default();
         config.save(&args.config)?;
         println!("Default config generated at: {}", args.config);
-        println!("Master wallet public key: {}", config.master_pubkey.unwrap_or_default());
+        println!("Master wallet public key: {}", config.master_pubkey.unwrap());
         println!("Please fund this wallet before running transfers");
         return Ok(());
     }
@@ -49,14 +49,17 @@ async fn main() -> Result<()> {
     
     println!("Using RPC endpoints: {}", config.rpc_urls.join(", "));
     println!("Master wallet: {}", config.get_master_pubkey()?);
-    println!("Target address: {}", config.target_pubkey);
+    if let Some(ref target) = config.target_pubkey {
+        println!("Note: target_pubkey is set to {}, but will be ignored", target);
+    }
+    
+    // Print configuration information
+    println!("Concurrency: {}", config.concurrency);
+    println!("Amount per transfer: {} SOL", config.amount);
+    println!("Each wallet will send transactions to itself for maximum concurrency");
     
     // Create transfer service
     let transfer_service = TransferService::new(config)?;
-    
-    // Test RPC endpoints
-    println!("Testing RPC endpoints...");
-    transfer_service.test_rpc_endpoints().await?;
     
     // Start transfers
     transfer_service.start_transfers().await?;

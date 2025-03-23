@@ -14,7 +14,7 @@ use solana_sdk::signature::read_keypair_file;
 use std::error::Error;
 use crate::wallet::WalletManager;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     // RPC endpoint URLs list
     pub rpc_urls: Vec<String>,
@@ -22,8 +22,8 @@ pub struct Config {
     pub seed_passphrase: Option<String>,
     // Master public key for funding derived wallets
     pub master_pubkey: Option<String>,
-    // Target public key for transfers
-    pub target_pubkey: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_pubkey: Option<String>,
     // Number of concurrent transactions
     pub concurrency: usize,
     // Amount to transfer each time (in SOL)
@@ -32,28 +32,26 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        // generate new 12 words seed phrase
-        let seed_phrase = generate_mnemonic_12_words()
-            .expect("Failed to generate seed words");
+        // Create random mnemonic
+        let mut entropy = [0u8; 16]; // 16 bytes/128 bits for 12 words
+        rand::rngs::OsRng.fill_bytes(&mut entropy);
+        let mnemonic = Mnemonic::from_entropy(&entropy).expect("Failed to create mnemonic");
         
-        // generate master keypair from seed phrase
-        let seed = seed_to_bytes(&seed_phrase)
-            .expect("Failed to create seed from mnemonic");
-            
+        // Convert mnemonic to seed and generate master keypair
+        let seed = mnemonic.to_seed("");
         let master_keypair = keypair_from_seed(&seed[..32])
             .expect("Failed to create keypair from seed");
         
+        // Get master pubkey to include in config
         let master_pubkey = master_keypair.pubkey().to_string();
-
+        
         Self {
-            rpc_urls: vec![
-                "https://rpc.testnet.x1.xyz".to_string(),
-            ],
-            seed_passphrase: Some(seed_phrase),
-            master_pubkey: Some(master_pubkey),
-            target_pubkey: "B6eiBpErfZAsMN29N1ug9r9cLnd9NBVGA4rw3ABHXA1J".to_string(),
-            concurrency: 8,
-            amount: 0.000001,
+            rpc_urls: vec!["https://rpc.testnet.x1.xyz".to_string()],
+            seed_passphrase: Some(mnemonic.to_string()),
+            master_pubkey: Some(master_pubkey),  // Set the master pubkey
+            target_pubkey: None,  // No longer needed for target public key
+            concurrency: 10,
+            amount: 0.000001,  // Default 0.000001 SOL
         }
     }
 }
