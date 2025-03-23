@@ -184,73 +184,69 @@ impl TransferService {
                 
                 println!("Task {} started with wallet {} (sending to self)", i, pubkey);
                 
+                // Pre-fetch blockhash occasionally to avoid fetching for every tx
+                let mut recent_blockhash = rpc_manager.next_client().get_latest_blockhash()
+                    .expect("Failed to get initial blockhash");
+                let mut last_blockhash_update = Instant::now();
+                
                 while is_running.load(Ordering::SeqCst) {
                     // Get next RPC client
                     let client = rpc_manager.next_client();
                     let client_url = client.url().to_string();
                     
-                    // Create and send transaction without waiting for confirmation
-                    // Key change: target address is wallet's own pubkey
+                    // Update blockhash every ~1 second instead of every transaction
+                    if last_blockhash_update.elapsed().as_secs() >= 1 {
+                        match client.get_latest_blockhash() {
+                            Ok(blockhash) => {
+                                recent_blockhash = blockhash;
+                                last_blockhash_update = Instant::now();
+                            },
+                            Err(_) => {
+                                // Silently continue using old blockhash if update fails
+                                // This avoids interrupting the sending loop
+                            }
+                        }
+                    }
+                    
+                    // Create transaction without waiting for confirmation
                     let instruction = system_instruction::transfer(
                         &task_keypair.pubkey(),
                         &pubkey,  // Send to self
                         lamports,
                     );
                     
-                    let start = Instant::now();
-                    let blockhash_result = client.get_latest_blockhash();
+                    let transaction = Transaction::new_signed_with_payer(
+                        &[instruction],
+                        Some(&task_keypair.pubkey()),
+                        &[&task_keypair],
+                        recent_blockhash,
+                    );
                     
-                    match blockhash_result {
-                        Ok(recent_blockhash) => {
-                            rpc_manager.record_result(&client_url, true, start.elapsed());
-                            
-                            let transaction = Transaction::new_signed_with_payer(
-                                &[instruction],
-                                Some(&task_keypair.pubkey()),
-                                &[&task_keypair],
-                                recent_blockhash,
-                            );
-                            
-                            // Send transaction, don't wait for confirmation
-                            let send_start = Instant::now();
-                            match client.send_transaction(&transaction) {
-                                Ok(signature) => {
-                                    let elapsed = send_start.elapsed();
-                                    rpc_manager.record_result(&client_url, true, elapsed);
-                                    
-                                    println!("Task {}: Transaction sent via {}: {} ({} ms)", 
-                                        i, client_url, signature, elapsed.as_millis());
-                                    
-                                    success_counter.fetch_add(1, Ordering::SeqCst);
-                                    tx_counter.fetch_add(1, Ordering::SeqCst);
-                                }
-                                Err(e) => {
-                                    rpc_manager.record_result(&client_url, false, send_start.elapsed());
-                                    println!("Task {}: Failed to send transaction via {}: {}", 
-                                        i, client_url, e);
-                                    
-                                    error_counter.fetch_add(1, Ordering::SeqCst);
-                                    
-                                    // If insufficient funds error, stop all tasks
-                                    if e.to_string().contains("insufficient funds") {
-                                        println!("Task {}: Insufficient funds. Stopping all tasks.", i);
-                                        is_running.store(false, Ordering::SeqCst);
-                                        break;
-                                    }
-                                }
+                    // Send transaction without waiting for confirmation or extensive error handling
+                    match client.send_transaction(&transaction) {
+                        Ok(signature) => {
+                            // Minimal logging - consider removing for max performance
+                            if success_counter.fetch_add(1, Ordering::SeqCst) % 100 == 0 {
+                                println!("Task {}: Sent 100 transactions (latest: {})", i, signature);
                             }
-                        },
+                            tx_counter.fetch_add(1, Ordering::SeqCst);
+                        }
                         Err(e) => {
-                            rpc_manager.record_result(&client_url, false, start.elapsed());
-                            println!("Task {}: Failed to get blockhash from {}: {}", 
-                                i, client_url, e);
-                            
+                            // Minimal error handling - only count errors
                             error_counter.fetch_add(1, Ordering::SeqCst);
+                            
+                            // Only stop on insufficient funds error
+                            if e.to_string().contains("insufficient funds") {
+                                println!("Task {}: Insufficient funds. Stopping.", i);
+                                is_running.store(false, Ordering::SeqCst);
+                                break;
+                            }
                         }
                     }
                     
-                    // Add a very small delay to prevent sending too frequently
-                    tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                    // Remove the sleep delay completely for maximum throughput
+                    // If needed, you can add a yield_now() to prevent CPU monopolization
+                    // tokio::task::yield_now().await;
                 }
                 
                 println!("Task {} finished", i);
